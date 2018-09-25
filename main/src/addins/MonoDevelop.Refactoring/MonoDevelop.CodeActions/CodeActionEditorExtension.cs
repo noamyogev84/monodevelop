@@ -49,12 +49,14 @@ using MonoDevelop.Ide.Editor.Extension;
 using MonoDevelop.Refactoring;
 using RefactoringEssentials;
 using MonoDevelop.AnalysisCore.Gui;
+using MonoDevelop.SourceEditor;
+using Gdk;
 
 namespace MonoDevelop.CodeActions
 {
 	class CodeActionEditorExtension : TextEditorExtension
 	{
-		const int menuTimeout = 250;
+		const int menuTimeout = 150;
 		uint smartTagPopupTimeoutId;
 
 		void CancelSmartTagPopupTimeout ()
@@ -68,13 +70,17 @@ namespace MonoDevelop.CodeActions
 
 		void RemoveWidget ()
 		{
-			if (currentSmartTag != null) {
-				Editor.RemoveMarker (currentSmartTag);
-				currentSmartTag.CancelPopup -= CurrentSmartTag_CancelPopup;
-				currentSmartTag.ShowPopup -= CurrentSmartTag_ShowPopup;
-
-				currentSmartTag = null;
+			if (floatingWidget != null) {
+				var sourceEditorView = Editor.GetContent<SourceEditorView> ();
+				sourceEditorView.TextEditor.TextArea.Remove (floatingWidget);
+				floatingWidget.Destroy ();
+				floatingWidget = null;
+			}
+			if (smartTagMarginMarker != null) {
 				currentSmartTagBegin = -1;
+
+				Editor.RemoveMarker (smartTagMarginMarker);
+				smartTagMarginMarker = null;
 			}
 			CancelSmartTagPopupTimeout ();
 		}
@@ -178,9 +184,9 @@ namespace MonoDevelop.CodeActions
 			}, cancellationToken);
 		}
 
-		async void PopupQuickFixMenu (Gdk.EventButton evt, Action<CodeFixMenu> menuAction)
+		async void PopupQuickFixMenu (Gdk.EventButton evt, Action<CodeFixMenu> menuAction, Xwt.Point? point = null)
 		{
-			using (Counters.FixesMenu.BeginTiming ("Show quick fixes menu")) {
+			using (Refactoring.Counters.FixesMenu.BeginTiming ("Show quick fixes menu")) {
 				var token = quickFixCancellationTokenSource.Token;
 
 				var fixes = await GetCurrentFixesAsync (token);
@@ -199,7 +205,7 @@ namespace MonoDevelop.CodeActions
 				if (menuAction != null)
 					menuAction (menu);
 
-				var p = Editor.LocationToPoint (Editor.OffsetToLocation (currentSmartTagBegin));
+				var p = point ?? Editor.LocationToPoint (Editor.OffsetToLocation (currentSmartTagBegin));
 				Widget widget = Editor;
 				var rect = new Gdk.Rectangle (
 					(int)p.X + widget.Allocation.X,
@@ -223,7 +229,7 @@ namespace MonoDevelop.CodeActions
 				y = evt.Y;
 
 				// Explicitly release the grab because the menu is shown on the mouse position, and the widget doesn't get the mouse release event
-				Gdk.Pointer.Ungrab (Global.CurrentEventTime);
+				Gdk.Pointer.Ungrab (Gtk.Global.CurrentEventTime);
 				var menu = CreateContextMenu (entrySet);
 				RefactoringPreviewTooltipWindow.HidePreviewTooltip ();
 				menu.Show (parent, x, y, () => {
@@ -273,8 +279,9 @@ namespace MonoDevelop.CodeActions
 			return menu;
 		}
 
-		ISmartTagMarker currentSmartTag;
+		SourceEditor.SmartTagMarginMarker smartTagMarginMarker;
 		int currentSmartTagBegin;
+		private FloatingQuickFixIconWidget floatingWidget;
 
 		void CreateSmartTag (CodeActionContainer fixes, int offset)
 		{
@@ -304,29 +311,88 @@ namespace MonoDevelop.CodeActions
 				first = false;
 			}
 
-			if (currentSmartTag != null && currentSmartTagBegin == smartTagLocBegin) {
+			if (currentSmartTagBegin == smartTagLocBegin) {
 				return;
 			}
 			RemoveWidget ();
 			currentSmartTagBegin = smartTagLocBegin;
-			var realLoc = Editor.OffsetToLocation (smartTagLocBegin);
+			SourceEditor.SmartTagSeverity severity = SmartTagSeverity.OnlyActions;
+			foreach (var fix in fixes.CodeFixActions) {
+				if (fix.FirstDiagnostic.Severity == DiagnosticSeverity.Error) {
+					severity = SourceEditor.SmartTagSeverity.ErrorFixes;
+					break;
+				}
+				if (fix.FirstDiagnostic.Severity == DiagnosticSeverity.Warning) {
+					severity = SourceEditor.SmartTagSeverity.Fixes;
+				}
+			}
 
-			currentSmartTag = TextMarkerFactory.CreateSmartTagMarker (Editor, smartTagLocBegin, realLoc);
-			currentSmartTag.CancelPopup += CurrentSmartTag_CancelPopup;
-			currentSmartTag.ShowPopup += CurrentSmartTag_ShowPopup;
-			currentSmartTag.Tag = fixes;
-			currentSmartTag.IsVisible = fixes.CodeFixActions.Sum (x => x.Fixes.Length) > 0;
-			editor.AddMarker (currentSmartTag);
+			if (!editor.IsSomethingSelected) {
+				var realLoc = Editor.OffsetToLocation (smartTagLocBegin);
+
+				smartTagMarginMarker = new SourceEditor.SmartTagMarginMarker ();
+				smartTagMarginMarker.ShowPopup += SmartTagMarginMarker_ShowPopup; ;
+				smartTagMarginMarker.SmartTagSeverity = severity;
+
+				editor.AddMarker (editor.GetLine (realLoc.Line), smartTagMarginMarker);
+			} else  {
+				var selection = editor.SelectionRegion;
+				var line = Math.Max (selection.BeginLine, selection.EndLine);
+				var col = selection.EndLine != selection.BeginLine ? 1 : Math.Min(selection.BeginColumn, selection.EndColumn);
+
+				var sourceEditorView = Editor.GetContent<SourceEditorView> ();
+				var point = sourceEditorView.TextEditor.TextArea.LocationToPoint (line, col);
+				point.Y += (int)editor.GetLineHeight (line);
+				floatingWidget = new FloatingQuickFixIconWidget (this, sourceEditorView, severity, point);
+				sourceEditorView.TextEditor.TextArea.AddTopLevelWidget (floatingWidget, point.X, point.Y);
+			}
+
 		}
 
-		void CurrentSmartTag_ShowPopup (object sender, EventArgs e)
+		class FloatingQuickFixIconWidget : EventBox
 		{
-			CurrentSmartTagPopup ();
+			readonly CodeActionEditorExtension ext;
+			private readonly SourceEditorView sourceEditorView;
+			private readonly Cairo.Point point;
+
+			public FloatingQuickFixIconWidget (CodeActionEditorExtension codeActionEditorExtension, SourceEditorView sourceEditorView, SourceEditor.SmartTagSeverity severity, Cairo.Point point)
+			{
+				this.ext = codeActionEditorExtension;
+				this.sourceEditorView = sourceEditorView;
+				this.point = point;
+				Frame fr = new Frame ();
+				fr.ShadowType = ShadowType.Out;
+				var view = new Gtk.Image ();
+				view.Pixbuf = SmartTagMarginMarker.GetIcon (severity).ToPixbuf ();
+				fr.Add (view);
+				Add (fr);
+
+				ShowAll ();
+			}
+
+			protected override bool OnButtonPressEvent (EventButton evnt)
+			{
+				ext.CancelSmartTagPopupTimeout ();
+				ext.smartTagPopupTimeoutId = GLib.Timeout.Add (menuTimeout, delegate {
+					ext.PopupQuickFixMenu (null, menu => { }, new Xwt.Point (point.X - sourceEditorView.TextEditor.HAdjustment.Value, point.Y - sourceEditorView.TextEditor.VAdjustment.Value - 4));
+					ext.smartTagPopupTimeoutId = 0;
+					return false;
+				});
+
+				return base.OnButtonPressEvent (evnt);
+			}
 		}
 
-		void CurrentSmartTag_CancelPopup (object sender, EventArgs e)
+		void SmartTagMarginMarker_ShowPopup (object sender, EventArgs e)
 		{
+			var marker = (SourceEditor.SmartTagMarginMarker)sender;
+
 			CancelSmartTagPopupTimeout ();
+			smartTagPopupTimeoutId = GLib.Timeout.Add (menuTimeout, delegate {
+				PopupQuickFixMenu (null, menu => { }, marker.PopupPosition);
+				smartTagPopupTimeoutId = 0;
+				return false;
+			});
 		}
 
 		protected override void Initialize ()
@@ -375,7 +441,7 @@ namespace MonoDevelop.CodeActions
 		[CommandHandler (RefactoryCommands.QuickFix)]
 		void OnQuickFixCommand ()
 		{
-			if (!AnalysisOptions.EnableFancyFeatures || currentSmartTag == null) {
+			if (!AnalysisOptions.EnableFancyFeatures || smartTagMarginMarker == null) {
 				//Fixes = RefactoringService.GetValidActions (Editor, DocumentContext, Editor.CaretLocation).Result;
 
 				currentSmartTagBegin = Editor.CaretOffset;
